@@ -9,37 +9,31 @@ MIN_BLADE_AREA = 5000
 def get_cleaned_mask(frame, fgbg):
     mask = fgbg.apply(frame, learningRate=0.005)
     _, mask = cv2.threshold(mask, 250, 255, cv2.THRESH_BINARY)
-    # Fast cleanup
+    
+    # Initial cleanup
     kernel = np.ones((5,5), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9,9), np.uint8))
     return mask
 
-def get_fast_line_approx(skeleton_img):
+def prune_skeleton(skeleton_img):
     """
-    Fits a line through skeleton pixels using M-estimator (Least Squares).
-    Highly efficient and ignores minor skeleton 'hairs'.
+    Finds all connected components in the skeleton and keeps only the longest one.
     """
-    # Find all non-zero pixel coordinates
-    pts = np.column_stack(np.where(skeleton_img > 0))
+    # Find all connected components (the main spine and the hairs)
+    contours, _ = cv2.findContours(skeleton_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     
-    if len(pts) < 10: # Minimum points to define a meaningful line
-        return None, None
-
-    # cv2.fitLine expects (N, 1, 2) or (N, 2) float32 array in (x, y) format
-    # np.where returns (row, col) which is (y, x), so we flip them
-    pts_float = pts[:, [1, 0]].astype(np.float32)
+    if not contours:
+        return np.zeros_like(skeleton_img)
     
-    # fitLine returns: [vx, vy, x0, y0] where (vx, vy) is a normalized 
-    # vector and (x0, y0) is a point on the line.
-    [vx, vy, x, y] = cv2.fitLine(pts_float, cv2.DIST_L2, 0, 0.01, 0.01)
+    # Find the longest contour based on arc length
+    longest_contour = max(contours, key=lambda x: cv2.arcLength(x, False))
     
-    # Determine line endpoints for visualization (scaled to blade size)
-    # Increase 'length' if the line is too short for your turbine
-    length = 200 
-    pt1 = (int(x - vx * length), int(y - vy * length))
-    pt2 = (int(x + vx * length), int(y + vy * length))
+    # Create a blank mask and draw only the longest line
+    pruned = np.zeros_like(skeleton_img)
+    cv2.drawContours(pruned, [longest_contour], -1, 255, 1)
     
-    return pt1, pt2
+    return pruned
 
 def main():
     cap = cv2.VideoCapture(VIDEO_PATH)
@@ -50,25 +44,36 @@ def main():
         if not ret: break
         
         mask = get_cleaned_mask(frame, fgbg)
-        display_frame = frame.copy()
         
-        # Check if we have enough white pixels to process
         if np.sum(mask > 0) > MIN_BLADE_AREA:
-            # 1. Generate Skeleton
+            # 1. Generate Raw Skeleton
             skeleton_bool = skeletonize(mask > 0)
             skeleton_uint8 = (skeleton_bool * 255).astype(np.uint8)
             
-            # 2. Fit Line (The 'Smoothing' step)
-            p1, p2 = get_fast_line_approx(skeleton_uint8)
+            # 2. Prune: Keep only the longest line
+            clean_skeleton = prune_skeleton(skeleton_uint8)
             
-            # 3. Draw result
-            if p1 is not None:
-                cv2.line(display_frame, p1, p2, (0, 255, 0), 2, cv2.LINE_AA)
+            # 3. Visualization
+            display_frame = frame.copy()
+            # Draw the pruned skeleton in Green
+            display_frame[clean_skeleton > 0] = (0, 255, 0)
+            
+            # Draw a thick version of the skeleton so it's easier to see
+            kernel_dilate = np.ones((3,3), np.uint8)
+            thick_skel = cv2.dilate(clean_skeleton, kernel_dilate)
+            display_frame[thick_skel > 0] = (0, 255, 0) 
+            
+        else:
+            display_frame = frame.copy()
+
+        # Debug UI
+        frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+        cv2.putText(display_frame, f"Frame: {frame_idx}", (20, 40), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+        cv2.imshow('Pruned Skeleton (Longest Line Only)', display_frame)
         
-        # Display
-        cv2.imshow('Fast Line Fit', display_frame)
-        
-        key = cv2.waitKey(1) & 0xFF
+        key = cv2.waitKey(30) & 0xFF
         if key == 27: break
         if key == ord(' '): cv2.waitKey(-1)
 
