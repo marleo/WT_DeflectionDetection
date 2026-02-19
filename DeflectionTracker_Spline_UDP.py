@@ -10,6 +10,7 @@ from scipy.interpolate import UnivariateSpline
 VIDEO_PATH     = r"C:\Users\Mario\Videos\ModelTurbine\TopDown\clockwise_8rpm_long.mp4"
 MIN_BLADE_AREA = 5000
 SPLINE_SMOOTHING = 5000   # Higher = smoother, more outlier rejection
+DISCARD_FRAMES = 500 # how many frames to discard at the beginning of the video for the history to build up
 
 # Define the frame windows in which spline + angle calculation is active.
 # Format: list of (start_frame, end_frame) tuples  (inclusive on both ends).
@@ -68,7 +69,8 @@ def _build_calc_windows_from_csv(
             for col in blade_cols
             if abs(row[col]) <= angle_tolerance_rad
         ]
-        hits.append((frame_no, blades))
+        if frame_no > DISCARD_FRAMES:
+            hits.append((frame_no, blades))
 
     if not hits:
         print("[_build_calc_windows_from_csv] WARNING: no near-zero frames found – CALC_WINDOWS unchanged.")
@@ -175,7 +177,30 @@ def fit_smooth_spline(skeleton_img, smoothing=SPLINE_SMOOTHING):
     return np.column_stack([spl_x(t_fine), spl_y(t_fine)])
 
 
-def measure_deflection_angle(spline_pts, fraction=0.25):
+def measure_deflection_angle(spline_pts, root_fraction=0.25, tip_fraction=0.10):
+    """
+    Angle between PCA tangent at root (first `root_fraction`) and tip (last `tip_fraction`).
+    Returns (angle_deg, v_root, v_tip, root_anchor, tip_anchor).
+    """
+    n = len(spline_pts)
+    n_root = max(6, int(n * root_fraction))
+    n_tip  = max(6, int(n * tip_fraction))
+
+    root_pts = spline_pts[:n_root]
+    tip_pts  = spline_pts[-n_tip:]
+
+    def pca_dir(pts):
+        c = pts - pts.mean(axis=0)
+        _, _, Vt = np.linalg.svd(c, full_matrices=False)
+        return Vt[0]
+
+    v_root = pca_dir(root_pts)
+    v_tip  = pca_dir(tip_pts)
+
+    cos_a     = np.clip(np.abs(np.dot(v_root, v_tip)), 0.0, 1.0)
+    angle_deg = np.degrees(np.arccos(cos_a))
+
+    return angle_deg, v_root, v_tip, root_pts.mean(axis=0), tip_pts.mean(axis=0)
     """
     Angle between PCA tangent at root (first `fraction`) and tip (last `fraction`).
     Returns (angle_deg, v_root, v_tip, root_anchor, tip_anchor).
@@ -247,7 +272,7 @@ def draw_results_overlay(frame, completed_results, blade_labels=None):
     blade_tag  = blade_labels.get(latest_idx, "")
     blade_part = f"  {blade_tag}" if blade_tag else ""
     # Two-line badge: dim label row + bright value row
-    y = _draw_badge(frame, f"LAST RESULT  •  Win {latest_idx}{blade_part}",
+    y = _draw_badge(frame, f"LAST RESULT  ->  Win {latest_idx}{blade_part}",
                     20, 108, font_scale=_FONT_SM,
                     txt_color=(180, 180, 180), bg_color=(20, 20, 20), alpha=0.6)
     _draw_badge(frame, f"{avg_angle:.2f} deg  (avg)",
@@ -308,12 +333,31 @@ def main(calc_windows=CALC_WINDOWS):
         # ------------------------------------------------------------------
         if active_window_idx is not None and np.sum(mask > 0) > MIN_BLADE_AREA:
 
-            skeleton_bool  = skeletonize(mask > 0)
-            skeleton_uint8 = (skeleton_bool * 255).astype(np.uint8)
-            clean_skeleton = prune_skeleton(skeleton_uint8)
+            # -- OPTIMIZATION 1: Bounding Box ROI --
+            # Isolate the processing area to the blade's exact dimensions
+            y_coords, x_coords = np.nonzero(mask)
+            if len(y_coords) > 0 and len(x_coords) > 0:
+                y_min, y_max = np.min(y_coords), np.max(y_coords)
+                x_min, x_max = np.min(x_coords), np.max(x_coords)
 
-            # --------------------------------------------------
-            spline_pts = fit_smooth_spline(clean_skeleton)
+                mask_roi = mask[y_min:y_max+1, x_min:x_max+1]
+
+                # -- OPTIMIZATION 2: OpenCV Fast Spatial Thinning --
+                # Significantly faster than skimage morphological thinning
+                skeleton_roi = cv2.ximgproc.thinning(
+                    mask_roi, 
+                    thinningType=cv2.ximgproc.THINNING_GUOHALL
+                )
+
+                # Reconstruct full-size frame array
+                skeleton_uint8 = np.zeros_like(mask)
+                skeleton_uint8[y_min:y_max+1, x_min:x_max+1] = skeleton_roi
+
+                clean_skeleton = prune_skeleton(skeleton_uint8)
+
+                # --------------------------------------------------
+                spline_pts = fit_smooth_spline(clean_skeleton)
+
             if spline_pts is not None:
                 # Draw spline in cyan
                 for i in range(len(spline_pts) - 1):
